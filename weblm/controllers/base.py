@@ -1,5 +1,3 @@
-import csv
-import heapq
 import itertools
 import json
 import math
@@ -8,152 +6,17 @@ import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
-from typing import Any, DefaultDict, Dict, List, Tuple, Union
+from typing import Any, Callable, DefaultDict, Dict, List, Tuple, Union
 
-import cohere
 import numpy as np
-from requests.exceptions import ConnectionError
 
-MAX_SEQ_LEN = 2000
-MAX_NUM_ELEMENTS = 50
+from .stubs import *
+
 TYPEABLE = ["input", "select"]
 CLICKABLE = ["link", "button"]
-MODEL = "xlarge"
-
-help_msg = """Welcome to WebLM!
-
-The goal of this project is build a system that takes an objective from the user, and operates a browser to carry it out.
-
-For example:
-- book me a table for 2 at bar isabel next wednesday at 7pm
-- i need a flight from SF to London on Oct 15th nonstop
-- buy me more whitening toothpaste from amazon and send it to my apartment
-
-WebLM learns to carry out tasks *by demonstration*. That means that you'll need to guide it and correct it when it goes astray. Over time, the more people who use it, the more tasks it's used for, WebLM will become better and better and rely less and less on user input.
-
-To control the system:
-- You can see what the model sees at each step by looking at the list of elements the model can interact with
-- show: You can also see a picture of the browser window by typing `show`
-- goto: You can go to a specific webpage by typing `goto www.yourwebpage.com`
-- success: When the model has succeeded at the task you set out (or gotten close enough), you can teach the model by typing `success` and it will save it's actions to use in future interations
-- cancel: If the model is failing or you made a catastrophic mistake you can type `cancel` to kill the session
-- help: Type `help` to show this message
-
-Everytime you use WebLM it will improve. If you want to contribute to the project and help us build join the discord (https://discord.com/invite/co-mmunity) or send an email to weblm@cohere.com"""
-
-prompt_template = """Given:
-    (1) an objective that you are trying to achieve
-    (2) the URL of your current web page
-    (3) a simplified text description of what's visible in the browser window
-
-Your commands are:
-    click X - click on element X.
-    type X "TEXT" - type the specified text into input X
-    summary - summarize the text in the page
-
-Here are some examples:
-
-$examples
-
-Present state:
-$state
-Next Command:"""
-
-state_template = """Objective: $objective
-Current URL: $url
-Current Browser Content:
-------------------
-$browser_content
-------------------
-Previous actions:
-$previous_commands"""
-
-prioritization_template = """Here are the most relevant elements on the webpage (links, buttons, selects and inputs) to achieve the objective below:
-Objective: buy me toothpaste from amazon
-URL: https://www.google.com/search?q=toothpaste+amazon&source=hp&ei=CpBZY5PrNsKIptQP77Se0Ag&iflsig=AJiK0e
-Relevant elements:
-link 255 role="text" role="text" "toothpaste - Amazon.com https://www.amazon.com › toothpaste › k=toothpaste"
-link 192 role="text" role="text" "Best Sellers in Toothpaste - Amazon.ca https://www.amazon.ca › zgbs › beauty"
-link 148 role="heading" role="text" "Shop Amazon toothpaste - Amazon.ca Official Site Ad · https://www.amazon.ca/"
----
-Here are the most relevant elements on the webpage (links, buttons, selects and inputs) to achieve the objective below:
-Objective: book me in for 2 at bar isabel in toronto on friday night
-URL: https://www.opentable.ca/r/bar-isabel-toronto
-Relevant elements:
-select 119 TxpENin57omlyGS8c0YB Time selector restProfileSideBartimePickerDtpPicker "5:00 p.m. 5:30 p.m. 6:00 p.m. 6:30 p.m. 7:00 p.m. 7:30 p.m. 8:00 p.m. 8:30 p.m. 9:00 p.m. 9:30 p.m. 10:00 p.m. 10:30 p.m. 11:00 p.m. 11:30 p.m."
-select 114 Party size selector FfVyD58WJTQB9nBaLQRB restProfileSideBarDtpPartySizePicker "1 person 2 people 3 people 4 people 5 people 6 people 7 people 8 people 9 people 10 people 11 people 12 people 13 people 14 people 15 people 16 people 17 people 18 people 19 people 20 people"
-button 121 aria-label="Find a time" "Find a time"
----
-Here are the most relevant elements on the webpage (links, buttons, selects and inputs) to achieve the objective below:
-Objective: email aidan@cohere.com telling him I'm running a few mins late
-URL: https://www.google.com/?gws_rd=ssl
-Relevant elements:
-link 3 "Gmail"
-input 10 gLFyf gsfi q text combobox Search Search
----
-Here are the most relevant elements on the webpage (links, buttons, selects and inputs) to achieve the objective below:
-Objective: buy me a pair of sunglasses from amazon
-URL: https://www.amazon.ca/LUENX-Aviator-Sunglasses-Polarized-Gradient/dp/B08P7HMKJW
-Relevant elements:
-button 153 add-to-cart-button submit.add-to-cart Add to Shopping Cart a-button-input Add to Cart
-button 155 buy-now-button submit.buy-now a-button-input
-select 152 quantity quantity a-native-dropdown a-declarative "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30"
----
-Here are the most relevant elements on the webpage (links, buttons, selects and inputs) to achieve the objective below:
-Objective: $objective
-URL: $url
-Relevant elements:
-{element}"""
-
-user_prompt_end = "\n\t(success) the goal is accomplished" "\n\t(cancel) terminate the session" "\nType a choice and then press enter:"
-user_prompt_1 = (
-    "Given web state:\n{state}"
-    "\n\nI have to choose between `clicking` and `typing` here."
-    "\n**I think I should{action}**"
-    "\n\t(y) proceed with this action"
-    "\n\t(n) do the other action" + user_prompt_end
-)
-user_prompt_2 = (
-    "Given state:\n{self._construct_state(url, pruned_elements)}"
-    "\n\nSuggested command: {cmd}.\n\t(y) accept and continue"
-    "\n\t(s) save example, accept, and continue"
-    "\n{other_options}"
-    "\n\t(back) choose a different action"
-    "\n\t(enter a new command) type your own command to replace the model's suggestion" + user_prompt_end
-)
-user_prompt_3 = (
-    "Given state:\n{self._construct_state(url, pruned_elements)}"
-    "\n\nSuggested command: {self._cmd}.\n\t(y) accept and continue"
-    "\n\t(s) save example, accept, and continue"
-    "\n\t(back) choose a different action"
-    "\n\t(enter a new command) type your own command to replace the model's suggestion" + user_prompt_end
-)
 
 
-def _fn(x):
-    if len(x) == 3:
-        option, prompt, self = x
-        return_likelihoods = "ALL"
-    elif len(x) == 4:
-        option, prompt, self, return_likelihoods = x
-
-    while True:
-        try:
-            if len(self.co.tokenize(prompt)) > 2048:
-                prompt = truncate_left(self.co.tokenize, prompt)
-            return (
-                self.co.generate(prompt=prompt, max_tokens=0, model=MODEL, return_likelihoods=return_likelihoods).generations[0].likelihood,
-                option,
-            )
-        except cohere.error.CohereError as e:
-            print(f"Cohere fucked up: {e}")
-            continue
-        except ConnectionError as e:
-            print(f"Connection error: {e}")
-            continue
-
-
-def truncate_left(tokenize, prompt, *rest_of_prompt, limit=2048):
+def truncate_left(tokenize: Callable, prompt: str, *rest_of_prompt, limit: int = 2048):
     i = 0
     chop_size = 5
     print(f"WARNING: truncating sequence of length {len(tokenize(prompt + ''.join(rest_of_prompt)))} to length {limit}")
@@ -161,6 +24,38 @@ def truncate_left(tokenize, prompt, *rest_of_prompt, limit=2048):
         prompt = prompt[i * chop_size :]
         i += 1
     return prompt
+
+
+class Prompt:
+    def __init__(self, prompt: str, likelihood: float = 0.0) -> None:
+        self.prompt = prompt
+        self.likelihood = likelihood
+
+    def __str__(self) -> str:
+        return self.prompt
+
+    def __repr__(self) -> str:
+        return f"Prompt=>{self.__str__()}"
+
+
+class Command:
+    def __init__(self, cmd: str, likelihood: float = None) -> None:
+        self.cmd = cmd
+        self.likelihood = likelihood
+
+    def __str__(self) -> str:
+        return self.cmd
+
+    def __repr__(self) -> str:
+        return f"Command=>{self.__str__()}"
+
+
+class DialogueState(Enum):
+    Unset = None
+    Action = "pick action"
+    ActionFeedback = "action from feedback"
+    Command = "suggest command"
+    CommandFeedback = "command from feedback"
 
 
 def split_list_by_separators(l: List[Any], separator_sequences: List[List[Any]]) -> List[List[Any]]:
@@ -196,46 +91,6 @@ def split_list_by_separators(l: List[Any], separator_sequences: List[List[Any]])
     return split_list
 
 
-def search(co: cohere.Client, query: str, items: List[str], topk: int) -> List[str]:
-    embedded_items = np.array(co.embed(texts=items, truncate="RIGHT").embeddings)
-    embedded_query = np.array(co.embed(texts=[query], truncate="RIGHT").embeddings[0])
-    scores = np.einsum("i,ji->j", embedded_query, embedded_items) / (
-        np.linalg.norm(embedded_query) * np.linalg.norm(embedded_items, axis=1)
-    )
-    ind = np.argsort(scores)[-topk:]
-    return np.flip(np.array(items)[ind], axis=0)
-
-
-class Prompt:
-    def __init__(self, prompt: str) -> None:
-        self.prompt = prompt
-
-    def __str__(self) -> str:
-        return self.prompt
-
-    def __repr__(self) -> str:
-        return f"Prompt={self.__str__()}"
-
-
-class Command:
-    def __init__(self, cmd: str) -> None:
-        self.cmd = cmd
-
-    def __str__(self) -> str:
-        return self.cmd
-
-    def __repr__(self) -> str:
-        return f"Command={self.__str__()}"
-
-
-class DialogueState(Enum):
-    Unset = None
-    Action = "pick action"
-    ActionFeedback = "action from feedback"
-    Command = "suggest command"
-    CommandFeedback = "command from feedback"
-
-
 class Controller:
     """A Cohere-powered controller that takes in a browser state and produces and action.
 
@@ -247,18 +102,44 @@ class Controller:
     5. choose what element to click or what element to type in
     """
 
-    def __init__(self, co: cohere.Client, objective: str):
+    MAX_SEQ_LEN = 2000
+    MAX_NUM_ELEMENTS = 50
+
+    client_exception = None
+    client_exception_message = "Base Exception Message: {0}"
+
+    def __init__(self, objective: str, enable_threadpool: bool = True):
         """
         Args:
             co (cohere.Client): a Cohere Client
             objective (str): the objective to accomplish
         """
-        self.co = co
+        self.client = None
         self.objective = objective
         self.previous_commands: List[str] = []
         self.moments: List[Tuple[str, str, str]] = []
         self.user_responses: DefaultDict[str, int] = defaultdict(int)
+        self.enable_threadpool = enable_threadpool
+
         self.reset_state()
+
+    def embed(self, texts: List[str], truncate: str = "RIGHT") -> Any:
+        raise NotImplementedError("Implement on adapter")
+
+    def generate(self, prompt: str, **kwargs) -> Any:
+        raise NotImplementedError("Implement on adapter")
+
+    def tokenize(self, prompt: str) -> Any:
+        raise NotImplementedError("Implement on adapter")
+
+    def search(self, query: str, items: List[str], topk: int) -> List[str]:
+        embedded_items = np.array(self.embed(texts=items, truncate="RIGHT").embeddings)
+        embedded_query = np.array(self.embed(texts=[query], truncate="RIGHT").embeddings[0])
+        scores = np.einsum("i,ji->j", embedded_query, embedded_items) / (
+            np.linalg.norm(embedded_query) * np.linalg.norm(embedded_items, axis=1)
+        )
+        ind = np.argsort(scores)[-topk:]
+        return np.flip(np.array(items)[ind], axis=0)
 
     def is_running(self):
         return self._step != DialogueState.Unset
@@ -278,7 +159,7 @@ class Controller:
             self._save_example(url=url, elements=elements, command=command)
 
     def choose(
-        self, template: str, options: List[Dict[str, str]], return_likelihoods: str = "ALL", topk: int = 1
+        self, func: Callable, template: str, options: List[Dict[str, str]], return_likelihoods: str = "ALL", topk: int = 1
     ) -> List[Tuple[int, Dict[str, str]]]:
         """Choose the most likely continuation of `prompt` from a set of `options`.
 
@@ -289,12 +170,15 @@ class Controller:
         Returns:
             str: the most likely option from `options`
         """
-        num_options = min(len(options), 128)
-        with ThreadPoolExecutor(num_options) as pp:
-            _lh = pp.map(
-                _fn,
-                zip(options, [template.format(**option) for option in options], [self] * num_options, [return_likelihoods] * num_options),
-            )
+        num_options = min(len(options), 64)
+        zipped_args = list(zip(options, [template.format(**option) for option in options], [return_likelihoods] * num_options))
+
+        if self.enable_threadpool:
+            with ThreadPoolExecutor(num_options) as thread_pool:
+                _lh = thread_pool.map(func, zipped_args)
+
+        else:
+            _lh = [func(arg) for arg in zipped_args]
         return sorted(_lh, key=lambda x: x[0], reverse=True)[:topk]
 
     def choose_element(self, template: str, options: List[Dict[str, str]], group_size: int = 10, topk: int = 1) -> List[Dict[str, str]]:
@@ -326,7 +210,7 @@ class Controller:
             template_tmp = template.replace("elements", "\n".join(item["elements"] for item in group))
             options_tmp = [{"id": item["id"]} for item in group]
 
-            choice = [x[1] for x in self.choose(template_tmp, options_tmp, topk=topk)]
+            choice = [x[1] for x in self.choose(self._fn, template_tmp, options_tmp, topk=topk)]
             chosen_elements = []
             for x in choice:
                 chosen_elements.append(list(filter(lambda y: y["id"] == x["id"], group))[0])
@@ -348,11 +232,10 @@ class Controller:
         embeds = [h["embedding"] for h in history]
         examples = [h["example"] for h in history]
         embeds = np.array(embeds)
-        embedded_state = np.array(self.co.embed(texts=[state], truncate="RIGHT").embeddings[0])
+        embedded_state = np.array(self.embed(texts=[state], truncate="RIGHT").embeddings[0])
         scores = np.einsum("i,ji->j", embedded_state, embeds) / (np.linalg.norm(embedded_state) * np.linalg.norm(embeds, axis=1))
         ind = np.argsort(scores)[-topk:]
         examples = np.array(examples)[ind]
-
         return examples
 
     def _construct_prev_cmds(self) -> str:
@@ -371,7 +254,7 @@ class Controller:
         return prompt.replace("$state", state)
 
     def _save_example(self, url: str, elements: List[str], command: str):
-        state = self._construct_state(url, elements[:MAX_NUM_ELEMENTS])
+        state = self._construct_state(url, elements[: self.MAX_NUM_ELEMENTS])
         example = "Example:\n" f"{state}\n" f"Next Command: {command}\n" "----"
         print(f"Example being saved:\n{example}")
         with open("examples.json", "r") as fd:
@@ -385,7 +268,7 @@ class Controller:
         history.append(
             {
                 "example": example,
-                "embedding": self.co.embed(texts=[example]).embeddings[0],
+                "embedding": self.embed(texts=[example]).embeddings[0],
                 "url": url,
                 "elements": elements,
                 "command": command,
@@ -408,27 +291,11 @@ class Controller:
         self.user_responses = responses_to_save
         print(f"Responses being saved:\n{dict(responses_to_save)}")
 
-    def save_responses(self):
-        keys_to_save = ["y", "n", "s", "command", "success", "cancel"]
-        # Check if data file already exists
-        responses_filepath = "responses.csv"
-        if os.path.isfile(responses_filepath):
-            print("File exists")
-            with open(responses_filepath, "a+") as fd:
-                wr = csv.writer(fd, quoting=csv.QUOTE_ALL)
-                wr.writerow([self.user_responses[key] for key in keys_to_save])
-        else:
-            print("No data available")
-            with open(responses_filepath, "w+") as fd:
-                wr = csv.writer(fd, quoting=csv.QUOTE_ALL)
-                wr.writerow(keys_to_save)
-                wr.writerow([self.user_responses[key] for key in keys_to_save])
-
     def _shorten_prompt(self, url, elements, examples, *rest_of_prompt, target: int = MAX_SEQ_LEN):
         state = self._construct_state(url, elements)
         prompt = self._construct_prompt(state, examples)
 
-        tokenized_prompt = self.co.tokenize(prompt + "".join(rest_of_prompt))
+        tokenized_prompt = self.tokenize(text=prompt + "".join(rest_of_prompt))
         tokens = tokenized_prompt.token_strings
 
         split_tokens = split_list_by_separators(tokens, [["EX", "AMP", "LE"], ["Example"], ["Present", " state", ":", "\n"]])
@@ -456,7 +323,7 @@ class Controller:
         print(f"num examples: {len(examples) - j}")
 
         state, prompt = _fn(i, j)
-        if len(self.co.tokenize(prompt + "".join(rest_of_prompt))) <= target:
+        if len(self.tokenize(prompt + "".join(rest_of_prompt))) <= target:
             return state, prompt
 
         MIN_ELEMENTS = 7
@@ -470,8 +337,8 @@ class Controller:
         state, prompt = _fn(i, j)
 
         # last resort, start cutting off the bigging of the prompt
-        if len(self.co.tokenize(prompt + "".join(rest_of_prompt))) > target:
-            prompt = truncate_left(self.co.tokenize, prompt, *rest_of_prompt, limit=target)
+        if len(self.tokenize(text=prompt + "".join(rest_of_prompt))) > target:
+            prompt = truncate_left(self.tokenize, prompt, *rest_of_prompt, limit=target)
 
         return state, prompt
 
@@ -480,10 +347,10 @@ class Controller:
         prioritization = prioritization.replace("$objective", self.objective)
         prioritization = prioritization.replace("$url", url)
 
-        self._prioritized_elements = self.choose(prioritization, [{"element": x} for x in page_elements], topk=len(page_elements))
+        self._prioritized_elements = self.choose(self._fn, prioritization, [{"element": x} for x in page_elements], topk=len(page_elements))
         self._prioritized_elements = [x[1]["element"] for x in self._prioritized_elements]
         self._prioritized_elements_hash = hash(frozenset(page_elements))
-        self._pruned_prioritized_elements = self._prioritized_elements[:MAX_NUM_ELEMENTS]
+        self._pruned_prioritized_elements = self._prioritized_elements[: self.MAX_NUM_ELEMENTS]
         self._step = DialogueState.Action
         print(self._prioritized_elements)
 
@@ -496,16 +363,17 @@ class Controller:
         state = self._construct_state(url, self._pruned_prioritized_elements)
         examples = self.gather_examples(state)
         prompt = self._construct_prompt(state, examples)
+
         if self._step == DialogueState.Action:
             action = " click"
             if any(y in x for y in TYPEABLE for x in page_elements):
                 elements = list(filter(lambda x: any(x.startswith(y) for y in CLICKABLE + TYPEABLE), self._pruned_prioritized_elements))
+                state, prompt = self._shorten_prompt(url, elements, examples, target=self.MAX_SEQ_LEN)
 
-                state, prompt = self._shorten_prompt(url, elements, examples, target=MAX_SEQ_LEN)
-
-                action = self.choose(
-                    prompt + "{action}",
-                    [
+                actions = self.choose(
+                    func=self._fn,
+                    template=prompt + "{action}",
+                    options=[
                         {
                             "action": " click",
                         },
@@ -520,13 +388,15 @@ class Controller:
                 )
 
                 # if the model is confident enough, just assume the suggested action is correct
-                if (action[0][0] - action[1][0]) / -action[1][0] > 1.0:
+                if (actions[0][0] - actions[1][0]) / -actions[1][0] > 1.0:
                     action = action[0][1]["action"]
                 else:
-                    action = action[0][1]["action"]
+                    action = actions[0][1]["action"]
+                    likelihood = [math.exp(a[0]) for a in actions]
+                    likelihood = likelihood[0] / sum(likelihood)
                     self._action = action
                     self._step = DialogueState.ActionFeedback
-                    return Prompt(eval(f'f"""{user_prompt_1}"""'))
+                    return Prompt(eval(f'f"""{user_prompt_1}"""'), likelihood=likelihood)
 
             self._action = action
             self._step = DialogueState.Command
@@ -543,7 +413,7 @@ class Controller:
                 return Prompt(f"Examples:\n{examples}\n\n" "Please respond with 'y' or 'n'")
             elif re.match(r"search (.+)", response):
                 query = re.match(r"search (.+)", response).group(1)
-                results = search(self.co, query, self._page_elements, topk=50)
+                results = self.search(query, self._page_elements, topk=50)
                 return Prompt(f"Query: {query}\nResults:\n{results}\n\n" "Please respond with 'y' or 'n'")
             else:
                 return Prompt("Please respond with 'y' or 'n'")
@@ -556,15 +426,15 @@ class Controller:
             while text is None:
                 try:
                     num_tokens = 20
-                    if len(self.co.tokenize(prompt)) > 2048 - num_tokens:
-                        print(f"WARNING: truncating sequence of length {len(self.co.tokenize(prompt))}")
-                        prompt = truncate_left(self.co.tokenize, prompt, self._action, chosen_element, limit=2048 - num_tokens)
+                    if len(self.tokenize(prompt)) > 2048 - num_tokens:
+                        print(f"WARNING: truncating sequence of length {len(self.tokenize(prompt))}")
+                        prompt = truncate_left(self.tokenize, prompt, self._action, chosen_element, limit=2048 - num_tokens)
 
-                    print(len(self.co.tokenize(prompt + self._action + chosen_element)))
+                    print(len(self.tokenize(prompt + self._action + chosen_element)))
                     text = max(
-                        self.co.generate(
+                        self.generate(
                             prompt=prompt + self._action + chosen_element,
-                            model=MODEL,
+                            model=self.MODEL,
                             temperature=0.5,
                             num_generations=5,
                             max_tokens=num_tokens,
@@ -574,8 +444,8 @@ class Controller:
                         key=lambda x: x.likelihood,
                     ).text
                     print(text)
-                except cohere.error.CohereError as e:
-                    print(f"Cohere fucked up: {e}")
+                except Controller.client_exception as e:
+                    print(Controller.client_exception_message.format(e))
                     continue
         else:
             text = ""
@@ -585,7 +455,7 @@ class Controller:
     def use_text(
         self,
         prompt: str,
-        model: str = MODEL,
+        model: str = None,
         max_tokens: int = 192,
         temperature: float = 0.5,
         k: int = 0,
@@ -598,9 +468,9 @@ class Controller:
         return_text_only: bool = True,
         **kwargs,
     ):
-        response = self.co.generate(
+        response = self.generate(
             prompt=prompt,
-            model=model,
+            model=model if model else self.MODEL,
             max_tokens=max_tokens,
             temperature=temperature,
             k=k,
@@ -617,80 +487,100 @@ class Controller:
 
         return response
 
+    def generate_command_choose_element(
+        self, url: str, pruned_elements: List[str], examples: np.ndarray, prompt: str, state: str
+    ) -> Prompt:
+        """Generate a command by choosing an element from the prioritized list"""
+        if len(pruned_elements) == 1:
+            chosen_element = " " + " ".join(pruned_elements[0].split(" ")[:2])
+            self._chosen_elements = [{"id": chosen_element}]
+        else:
+            state = self._construct_state(url, ["$elements"])
+            prompt = self._construct_prompt(state, examples)
+
+            state, prompt = self._shorten_prompt(url, ["$elements"], examples, self._action)
+
+            group_size = 20
+            self._chosen_elements = self.choose_element(
+                prompt + self._action + "{id}",
+                list(map(lambda x: {"id": " " + " ".join(x.split(" ")[:2]), "elements": x}, pruned_elements)),
+                group_size,
+                topk=5,
+            )
+            chosen_element = self._chosen_elements[0]["id"]
+
+            state = self._construct_state(url, pruned_elements)
+            prompt = self._construct_prompt(state, examples)
+
+            state, prompt = self._shorten_prompt(url, pruned_elements, examples, self._action, chosen_element)
+
+        cmd = self._get_cmd_prediction(prompt, chosen_element)
+
+        self._cmd = cmd
+        self._step = DialogueState.CommandFeedback
+        other_options = "\n".join(f"\t({i+2}){self._action}{x['id']}" for i, x in enumerate(self._chosen_elements[1:]))
+        return Prompt(eval(f'f"""{user_prompt_2}"""'))
+
+    def generate_command_feedback_handler(
+        self, url: str, pruned_elements: List[str], examples: np.ndarray, prompt: str, response: str
+    ) -> Union[Command, Prompt]:
+        """Handle the feedback from the user on the generated command"""
+
+        match response:
+            case "examples":
+                examples = "\n".join(examples)
+                return Prompt(f"Examples:\n{examples}\n\n" "Please respond with 'y' or 'n'")
+            case "prompt":
+                chosen_element = self._chosen_elements[0]["id"]
+                state, prompt = self._shorten_prompt(url, pruned_elements, examples, self._action, chosen_element)
+                return Prompt(f"{prompt}\n\nPlease respond with 'y' or 's'")
+            case "recrawl":
+                return Prompt(eval(f'f"""{user_prompt_3}"""'))
+            case "elements":
+                return Prompt("\n".join(str(d) for d in self._chosen_elements))
+            case _:
+                if search_match := re.match(r"search (.+)", response):
+                    query = search_match.group(1)
+                    # results = self.search(query, self._page_elements, topk=50)
+                    results = self.search(query=query, items=self._page_elements, topk=50)
+                    return Prompt(f"Query: {query}\nResults:\n{results}\n\n" "Please respond with 'y' or 'n'")
+                elif re.match(r"\d+", response):
+                    chosen_element = self._chosen_elements[int(response) - 1]["id"]
+                    state, prompt = self._shorten_prompt(url, pruned_elements, examples, self._action, chosen_element)
+                    self._cmd = self._get_cmd_prediction(prompt, chosen_element)
+                    if "type" in self._action:
+                        return Prompt(eval(f'f"""{user_prompt_3}"""'))
+                elif response not in ["y", "s"]:
+                    self._cmd = response
+
+        cmd_pattern = r"(click|type) (link|button|input|select) [\d]+( \"\w+\")?"
+        other_cmds_pattern = r"(summary)( \"\w+\")?"  # probably want more diverse way to do this, e.g. summarize/summary/etc
+
+        if not re.match(cmd_pattern, self._cmd) and not re.match(other_cmds_pattern, self._cmd):
+            return Prompt(f"Invalid command '{self._cmd}'. Must match regex '{cmd_pattern}'. Try again...")
+
+        if response == "s":
+            self._save_example(url=url, elements=self._prioritized_elements, command=self._cmd)
+
+        return Command(self._cmd.strip())
+
     def generate_command(self, url: str, pruned_elements: List[str], response: str = None):
         state = self._construct_state(url, pruned_elements)
         examples = self.gather_examples(state)
         prompt = self._construct_prompt(state, examples)
 
-        if self._step == DialogueState.Command:
-            if len(pruned_elements) == 1:
-                chosen_element = " " + " ".join(pruned_elements[0].split(" ")[:2])
-                self._chosen_elements = [{"id": chosen_element}]
-            else:
-                state = self._construct_state(url, ["$elements"])
-                prompt = self._construct_prompt(state, examples)
-
-                state, prompt = self._shorten_prompt(url, ["$elements"], examples, self._action)
-
-                group_size = 20
-                self._chosen_elements = self.choose_element(
-                    prompt + self._action + "{id}",
-                    list(map(lambda x: {"id": " " + " ".join(x.split(" ")[:2]), "elements": x}, pruned_elements)),
-                    group_size,
-                    topk=5,
-                )
-                chosen_element = self._chosen_elements[0]["id"]
-
-                state = self._construct_state(url, pruned_elements)
-                prompt = self._construct_prompt(state, examples)
-
-                state, prompt = self._shorten_prompt(url, pruned_elements, examples, self._action, chosen_element)
-
-            cmd = self._get_cmd_prediction(prompt, chosen_element)
-
-            self._cmd = cmd
-            self._step = DialogueState.CommandFeedback
-            other_options = "\n".join(f"\t({i+2}){self._action}{x['id']}" for i, x in enumerate(self._chosen_elements[1:]))
-            return Prompt(eval(f'f"""{user_prompt_2}"""'))
-        elif self._step == DialogueState.CommandFeedback:
-            if response == "examples":
-                examples = "\n".join(examples)
-                return Prompt(f"Examples:\n{examples}\n\n" "Please respond with 'y' or 's'")
-            elif response == "prompt":
-                chosen_element = self._chosen_elements[0]["id"]
-                state, prompt = self._shorten_prompt(url, pruned_elements, examples, self._action, chosen_element)
-                return Prompt(f"{prompt}\n\nPlease respond with 'y' or 's'")
-            elif response == "recrawl":
-                return Prompt(eval(f'f"""{user_prompt_3}"""'))
-            elif response == "elements":
-                return Prompt("\n".join(str(d) for d in self._chosen_elements))
-            elif re.match(r"search (.+)", response):
-                query = re.match(r"search (.+)", response).group(1)
-                results = search(self.co, query, self._page_elements, topk=50)
-                return Prompt(f"Query: {query}\nResults:\n{results}\n\n" "Please respond with 'y' or 'n'")
-
-            if re.match(r"\d+", response):
-                chosen_element = self._chosen_elements[int(response) - 1]["id"]
-                state, prompt = self._shorten_prompt(url, pruned_elements, examples, self._action, chosen_element)
-                self._cmd = self._get_cmd_prediction(prompt, chosen_element)
-                if "type" in self._action:
-                    return Prompt(eval(f'f"""{user_prompt_3}"""'))
-            elif response != "y" and response != "s":
-                self._cmd = response
-
-            cmd_pattern = r"(click|type) (link|button|input|select) [\d]+( \"\w+\")?"
-            other_cmds_pattern = r"(summary)( \"\w+\")?"  # probably want more diverse way to do this, e.g. summarize/summary/etc
-
-            if not re.match(cmd_pattern, self._cmd) and not re.match(other_cmds_pattern, self._cmd):
-                return Prompt(f"Invalid command '{self._cmd}'. Must match regex '{cmd_pattern}'. Try again...")
-
-            if response == "s":
-                self._save_example(url=url, elements=self._prioritized_elements, command=self._cmd)
+        match self._step:
+            case DialogueState.Command:
+                return self.generate_command_choose_element(url, pruned_elements, examples, prompt, state)
+            case DialogueState.CommandFeedback:
+                if type(cmd := self.generate_command_feedback_handler(url, pruned_elements, examples, prompt, response)) == Prompt:
+                    return cmd
+            case _:
+                cmd = Command(self._cmd.strip())
 
         self.moments.append((url, self._prioritized_elements, self._cmd))
         self.previous_commands.append(self._cmd)
 
-        cmd = Command(self._cmd.strip())
         self.reset_state()
         return cmd
 
@@ -708,11 +598,12 @@ class Controller:
         if isinstance(action_or_prompt, Prompt):
             return action_or_prompt
 
-        if "click" in self._action:
-            pruned_elements = list(filter(lambda x: any(x.startswith(y) for y in CLICKABLE), self._pruned_prioritized_elements))
-        elif "type" in self._action:
-            pruned_elements = list(filter(lambda x: any(x.startswith(y) for y in TYPEABLE), self._pruned_prioritized_elements))
-        elif "summary" in self._action:
-            pruned_elements = ["summary of text on page"]
+        match self._action.strip():
+            case "click":
+                pruned_elements = list(filter(lambda x: any(x.startswith(y) for y in CLICKABLE), self._pruned_prioritized_elements))
+            case "type":
+                pruned_elements = list(filter(lambda x: any(x.startswith(y) for y in TYPEABLE), self._pruned_prioritized_elements))
+            case "summary":
+                pruned_elements = ["summary of text on page"]
 
         return self.generate_command(url, pruned_elements, response)
