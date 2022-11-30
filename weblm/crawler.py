@@ -27,17 +27,6 @@ URL_PATTERN = r"https?:\/\/(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{
 WINDOW_SIZE = {"width": 1280, "height": 1080}
 
 
-def replace_special_fields(cmd):
-    if exists("specials.json"):
-        with open("specials.json", "r") as fd:
-            specials = json.load(fd)
-
-        for k, v in specials.items():
-            cmd = cmd.replace(k, v)
-
-    return cmd
-
-
 class Crawler:
 
     def __init__(self):
@@ -87,16 +76,18 @@ class Crawler:
             y_d = max(0, y - height)
             y_d += 5 * int(y_d > 0)
 
-            if x_d or y_d:
-                self.page.evaluate(f"() => window.scrollTo({x_d}, {y_d})")
+            self.page.evaluate(f"() => window.scrollTo({x_d}, {y_d})")
 
-            self.page.mouse.click(x - x_d, y - y_d)
+            if x_d or y_d:
+                # not entirely sure this will work if there is scrolling
+                self.page.mouse.click(x - x_d, y - y_d)
+            else:
+                self.page.mouse.click(x + element["origin_x"], y + element["origin_y"])
         else:
             print("Could not find element")
 
     def type(self, id, text):
         self.click(id)
-        self.page.evaluate(f"() => document.activeElement.value = ''")
         self.page.keyboard.type(text)
 
     def enter(self):
@@ -286,10 +277,8 @@ class Crawler:
             meta_data = []
 
             # inefficient to grab the same set of keys for kinds of objects but its fine for now
-            element_attributes = find_attributes(attributes[index], [
-                "type", "placeholder", "aria-label", "name", "class", "id", "title", "alt", "role", "value",
-                "aria-labelledby", "aria-description", "aria-describedby"
-            ])
+            element_attributes = find_attributes(
+                attributes[index], ["type", "placeholder", "aria-label", "name", "title", "alt", "role", "value"])
 
             ancestor_exception = is_ancestor_of_anchor or is_ancestor_of_button or is_ancestor_of_select
             ancestor_node_key = None
@@ -380,9 +369,6 @@ class Crawler:
                         meta_data.append(f'{entry_key}="{entry_value}"')
                     else:
                         inner_text += f"{entry_value} "
-
-            if len(meta_data) > 2 or inner_text != "":
-                meta_data = list(filter(lambda x: not re.match("(class|id)=\".+\"", x), meta_data))
 
             if meta_data:
                 meta_string = " ".join(meta_data)
@@ -518,23 +504,12 @@ class AsyncCrawler(Crawler):
             x = element.get("center_x")
             y = element.get("center_y")
 
-            height, width = WINDOW_SIZE["height"], WINDOW_SIZE["width"]
-
-            x_d = max(0, x - width)
-            x_d += 5 * int(x_d > 0)
-            y_d = max(0, y - height)
-            y_d += 5 * int(y_d > 0)
-
-            if x_d or y_d:
-                await self.page.evaluate(f"() => window.scrollTo({x_d}, {y_d})")
-
-            await self.page.mouse.click(x - x_d, y - y_d)
+            await self.page.mouse.click(x, y)
         else:
             print("Could not find element")
 
     async def type(self, id, text):
         await self.click(id)
-        await self.page.evaluate(f"() => document.activeElement.value = ''")
         await self.page.keyboard.type(text)
 
     async def enter(self):
@@ -565,3 +540,14 @@ class AsyncCrawler(Crawler):
             raise Exception(f"Invalid command: {cmd}")
 
         time.sleep(2)
+
+
+def replace_special_fields(cmd):
+    if exists("specials.json"):
+        with open("specials.json", "r") as fd:
+            specials = json.load(fd)
+
+        for k, v in specials.items():
+            cmd = cmd.replace(k, v)
+
+    return cmd
